@@ -1,0 +1,13 @@
+node_modules
+.git
+.env
+.wwebjs_auth
+.wwebjs_cache
+test
+test-support
+*.md
+pnpm-lock.yaml
+pnpm-workspace.yaml
+Dockerfile
+.dockerignore
+render.yaml

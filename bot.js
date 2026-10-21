@@ -1,185 +1,124 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const nodemailer = require('nodemailer');
+'use strict';
 
-// Configuración del servidor SMTP
-const transporter = nodemailer.createTransport({
-    host: 'smtp.office365.com',
-    port: 587,
-    secure: false, // true para puerto 465, false para otros puertos
-    auth: {
-        user: 'helpdesk@avior.com.ve',
-        pass: '***REMOVED***'
-    }
-});
+// Hora de Venezuela para los IDs de ticket aunque el servidor en la nube esté en UTC.
+process.env.TZ = process.env.TZ || 'America/Caracas';
 
-// Función para generar ID único basado en fecha y hora
-function generarIDTicket() {
-    const fecha = new Date();
-    const año = fecha.getFullYear();
-    const mes = String(fecha.getMonth() + 1).padStart(2, '0');
-    const dia = String(fecha.getDate()).padStart(2, '0');
-    const horas = String(fecha.getHours()).padStart(2, '0');
-    const min = String(fecha.getMinutes()).padStart(2, '0');
-    const sec = String(fecha.getSeconds()).padStart(2, '0');
-    return `REQ-${año}${mes}${dia}-${horas}${min}${sec}`;
+const { randomBytes } = require('node:crypto');
+const { Client, LocalAuth, RemoteAuth } = require('whatsapp-web.js');
+
+const flow = require('./src/flow');
+const { entries: faqEntries } = require('./src/faq');
+const { Engine } = require('./src/engine');
+const { createMailer } = require('./src/mailer');
+const { createTickets } = require('./src/tickets');
+const { createServer } = require('./src/server');
+const { attachHandlers } = require('./src/app');
+
+const env = process.env;
+const num = (v, d) => (v !== undefined && v !== '' && !Number.isNaN(Number(v)) ? Number(v) : d);
+
+/**
+ * Sesión de WhatsApp:
+ *  - MONGODB_URI definida -> RemoteAuth: la sesión vive en MongoDB y sobrevive a reinicios
+ *    (necesario en nubes gratuitas, cuyo disco se borra).
+ *  - sin MONGODB_URI      -> LocalAuth en disco, igual que antes (desarrollo local).
+ */
+async function buildAuth() {
+  if (env.MONGODB_URI) {
+    const mongoose = require('mongoose');
+    const { MongoStore } = require('wwebjs-mongo');
+    await mongoose.connect(env.MONGODB_URI);
+    console.log('[wa] sesión remota en MongoDB');
+    return new RemoteAuth({
+      clientId: env.SESSION_ID || 'avior-bot',
+      store: new MongoStore({ mongoose }),
+      backupSyncIntervalMs: 300_000, // el primer respaldo ocurre ~5 min después de vincular
+    });
+  }
+  return new LocalAuth(env.SESSION_DIR ? { dataPath: env.SESSION_DIR } : undefined);
 }
 
-// Función auxiliar para despachar los correos
-async function sendTicketEmail(ticketId, tipoFalla, detallesRaw) {
+async function main() {
+  const state = { status: 'starting', qr: null, number: null };
+
+  // Clave para /qr: si no se define, se genera una y se imprime en el log.
+  let adminKey = env.ADMIN_KEY;
+  if (!adminKey) {
+    adminKey = randomBytes(16).toString('hex');
+    console.log(`[admin] ADMIN_KEY no definida; clave temporal: ${adminKey}`);
+  }
+
+  // El servidor HTTP arranca primero: la plataforma necesita ver el puerto abierto.
+  const port = num(env.PORT, 3000);
+  createServer({ state, adminKey }).listen(port, () => console.log(`[http] escuchando en :${port}`));
+
+  // Correo + tickets
+  const mailer = createMailer(env);
+  if (!mailer.configured) {
+    console.warn(`[mail] proveedor "${mailer.provider}" sin credenciales: los tickets solo quedarán en el log.`);
+  }
+  const ticketTo = env.TICKET_TO || env.MAIL_FROM || env.SMTP_USER || '';
+
+  const client = new Client({
+    authStrategy: await buildAuth(),
+    puppeteer: {
+      headless: true,
+      executablePath: env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage', // /dev/shm es pequeño en contenedores
+        '--disable-gpu',
+        '--no-zygote',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--mute-audio',
+      ],
+    },
+  });
+
+  // Si el correo falla del todo, avisar por WhatsApp a un administrador (opcional).
+  const tickets = createTickets({
+    mailer,
+    to: ticketTo,
+    onFailure: async (ticket, err) => {
+      if (!env.ADMIN_WHATSAPP) return;
+      const chat = `${env.ADMIN_WHATSAPP.replace(/\D/g, '')}@c.us`;
+      await client.sendMessage(chat, `⚠️ No pude enviar el correo del ticket ${ticket.id} (${ticket.type}). Revisa los logs. Error: ${err?.message}`);
+    },
+  });
+
+  const engine = new Engine({
+    flow,
+    faq: faqEntries,
+    tickets,
+    config: {
+      idleTimeoutMs: num(env.IDLE_TIMEOUT_MIN, 10) * 60_000,
+      handoffSilenceMs: num(env.HANDOFF_SILENCE_MIN, 120) * 60_000,
+      hintCooldownMs: num(env.HINT_COOLDOWN_MIN, 360) * 60_000,
+      greetUnknown: env.GREET_UNKNOWN !== 'false',
+    },
+  });
+
+  attachHandlers({ client, engine, state });
+
+  // Apagado ordenado (Render/Docker envían SIGTERM al redesplegar).
+  const shutdown = async (sig) => {
+    console.log(`[app] ${sig} recibido, cerrando…`);
     try {
-        // Mapear los detalles en bruto del chat a una lista HTML limpia
-        const lineasDetalles = detallesRaw
-            .split('\n')
-            .filter(linea => linea.trim() !== '') // Ignora líneas en blanco
-            .map(linea => `<li style="margin-bottom: 5px;">${linea}</li>`)
-            .join('');
+      await client.destroy();
+    } catch {}
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 
-        await transporter.sendMail({
-            from: '"WhatsApp Bot Help Desk" <helpdesk@avior.com.ve>',
-            to: 'helpdesk@avior.com.ve',
-            subject: `🚨 Ticket [${ticketId}]: ${tipoFalla}`,
-            html: `
-                <p>Se ha generado un nuevo reporte automático desde WhatsApp.</p>
-                <p>
-                    <strong>ID del Ticket:</strong> ${ticketId}<br>
-                    <strong>Tipo de Solicitud:</strong> ${tipoFalla}<br>
-                </p>
-                <div style="background-color: #f4f4f4; padding: 15px; border-left: 4px solid #005aa9; margin-top: 15px;">
-                    <strong>Detalles proporcionados por el usuario:</strong><br>
-                    <ul style="margin-top: 10px; padding-left: 20px; font-family: monospace; font-size: 14px;">
-                        ${lineasDetalles}
-                    </ul>
-                </div>
-                <p style="margin-top: 20px; color: #555;">🔍 <em>Para atender este caso, busca el Ticket <strong>${ticketId}</strong> en el buscador de WhatsApp.</em></p>
-            `
-        });
-        console.log(`Correo enviado a helpdesk para el ticket: ${ticketId}`);
-    } catch (error) {
-        console.error('Error enviando la alerta por correo:', error);
-    }
+  await client.initialize();
 }
 
-// Inicialización del cliente
-const client = new Client({
-    authStrategy: new LocalAuth()
+process.on('unhandledRejection', (err) => console.error('[app] unhandledRejection:', err));
+
+main().catch((err) => {
+  console.error('[app] error fatal al iniciar:', err);
+  process.exit(1);
 });
-
-client.on('qr', (qr) => {
-    qrcode.generate(qr, { small: true });
-    console.log('Escanea este código QR con el WhatsApp Business de la oficina.');
-});
-
-client.on('ready', () => {
-    console.log('¡El bot de Help Desk está activo y escuchando!');
-});
-
-const userStates = {};
-
-client.on('message', async (msg) => {
-    if (msg.isGroupMsg) return;
-
-    const chatId = msg.from;
-    const text = msg.body.trim().toLowerCase();
-
-    // Menú principal
-    if (text === 'menu' || text === 'hola' || text === 'cancelar') {
-        userStates[chatId] = { step: 'MENU' };
-        
-        await msg.reply(
-            "✈️ *Help Desk - Informática Avior* \n\n" +
-            "Bienvenido al soporte automatizado. Selecciona tu requerimiento:\n\n" +
-            "1️⃣ Correo Corporativo (Bloqueo / Olvido / Creación)\n" +
-            "2️⃣ Red e Internet (Falla de conexión en Estación u Oficina)\n" +
-            "3️⃣ Sistema KIU (Bloqueo / Reseteo de firma)\n" +
-            "4️⃣ Sistema SAP (Restablecimiento de clave)\n" +
-            "5️⃣ Accesos Remotos y VPN\n" +
-            "6️⃣ Falla de Hardware (PC, Impresoras, Teléfonos)\n" +
-            "7️⃣ Hablar con un Analista de Guardia 👨‍💻\n\n" +
-            "Responde con el número de tu opción. (Escribe *cancelar* en cualquier momento para volver aquí)."
-        );
-        return;
-    }
-
-    if (!userStates[chatId]) return;
-    const currentState = userStates[chatId].step;
-
-    if (currentState === 'MENU') {
-        switch (text) {
-            case '1':
-                await msg.reply("📧 *Soporte de Correo Corporativo:*\n\nPor favor, responde en un solo mensaje indicando:\n- **Cuenta de correo** afectada.\n- **Número de contacto o Extensión**.\n- **Falla exacta** (Ej: Olvidé la clave, bloqueada).");
-                userStates[chatId].step = 'WAITING_EMAIL_DATA';
-                break;
-            case '2':
-                await msg.reply("🌐 *Reporte de Caída de Red/Internet:*\n\nPor favor, responde en un solo mensaje indicando:\n- **Estación/Área** (Ej: BLA, CCS, Piso 2).\n- **Número de contacto o Extensión**.\n- **Tipo de falla** (Ej: No hay Wi-Fi, internet lento).");
-                userStates[chatId].step = 'WAITING_STATION_DATA';
-                break;
-            case '3':
-                await msg.reply("✈️ *Soporte KIU:*\n\nPor favor, responde en un solo mensaje indicando:\n- **Firma o Usuario KIU**.\n- **Número de contacto o Extensión**.\n- **Problema** (Ej: Bloqueo por intentos, reseteo).");
-                userStates[chatId].step = 'WAITING_KIU_DATA';
-                break;
-            case '4':
-                await msg.reply("⚠️ *Seguridad SAP:*\n\nPor favor, escribe tu **Número de Empleado y Extensión/Teléfono**. Un analista te llamará para validar tu identidad antes del reseteo.");
-                userStates[chatId].step = 'WAITING_SAP_DATA';
-                break;
-            case '5':
-                await msg.reply("🔐 *Accesos Remotos y VPN:*\n\nPor favor, responde en un solo mensaje indicando:\n- **Usuario VPN**.\n- **Número de contacto o Extensión**.\n- **Sistema/IP** al que intentas acceder.");
-                userStates[chatId].step = 'WAITING_VPN_DATA';
-                break;
-            case '6':
-                await msg.reply("🛠️ *Soporte de Hardware/Equipos:*\n\nPor favor, responde en un solo mensaje indicando:\n- **Tipo de equipo** (PC, Impresora, Teléfono).\n- **Número de contacto o Extensión**.\n- **Ubicación exacta y falla**.");
-                userStates[chatId].step = 'WAITING_HARDWARE_DATA';
-                break;
-            case '7':
-                userStates[chatId].step = 'HUMAN_HANDOFF';
-                const ticketIdManual = generarIDTicket();
-                await msg.reply(`🚨 Entendido. Tu caso fue registrado bajo el ticket *${ticketIdManual}*.\n\nEstoy derivando tu chat al **Analista de Help Desk de Guardia**. Por favor espera un momento en línea.`);
-                await sendTicketEmail(ticketIdManual, 'Asistencia Manual Requerida', 'El usuario ha solicitado hablar directamente con un analista.');                break;
-            default:
-                await msg.reply("Opción no válida. Por favor responde con un número del 1 al 7.");
-                break;
-        }
-    } 
-    
-    // Captura de datos y asignación de ID
-    else if (currentState === 'WAITING_EMAIL_DATA') {
-        const ticketId = generarIDTicket();
-        await msg.reply(`✅ Solicitud registrada con el ticket *${ticketId}*.\nUn analista revisará tu caso en breve.`);
-await sendTicketEmail(ticketId, 'Soporte de Correo Corporativo', msg.body);        delete userStates[chatId];
-    } 
-    else if (currentState === 'WAITING_STATION_DATA') {
-        const ticketId = generarIDTicket();
-        await msg.reply(`✅ Reporte de red registrado con el ticket *${ticketId}*.\nEl equipo de infraestructura ha sido notificado.`);
-        await sendTicketEmail(ticketId, 'Falla de Red/Internet', msg.body);
-        delete userStates[chatId];
-    } 
-    else if (currentState === 'WAITING_KIU_DATA') {
-        const ticketId = generarIDTicket();
-        await msg.reply(`✅ Solicitud KIU registrada con el ticket *${ticketId}*.\nTe notificaremos apenas se procese.`);
-        await sendTicketEmail(ticketId, 'Soporte Sistema KIU', msg.body);
-        delete userStates[chatId];
-    } 
-    else if (currentState === 'WAITING_SAP_DATA') {
-        const ticketId = generarIDTicket();
-        await msg.reply(`✅ Solicitud SAP registrada con el ticket *${ticketId}*.\nMantente atento, te contactaremos para validar tu identidad.`);
-        await sendTicketEmail(ticketId, 'Soporte Sistema SAP', msg.body);
-        delete userStates[chatId];
-    }
-    else if (currentState === 'WAITING_VPN_DATA') {
-        const ticketId = generarIDTicket();
-        await msg.reply(`✅ Reporte VPN registrado con el ticket *${ticketId}*.\nEl equipo de seguridad revisará tus permisos.`);
-        await sendTicketEmail(ticketId, 'Soporte VPN/Acceso Remoto', msg.body);
-        delete userStates[chatId];
-    }
-    else if (currentState === 'WAITING_HARDWARE_DATA') {
-        const ticketId = generarIDTicket();
-        await msg.reply(`✅ Reporte de hardware registrado con el ticket *${ticketId}*.\nUn analista evaluará el caso a la brevedad.`);
-        await sendTicketEmail(ticketId, 'Falla de Hardware/Equipos', msg.body);
-        delete userStates[chatId];
-    }
-    else if (currentState === 'HUMAN_HANDOFF') {
-        // Intervención manual, el bot no responde.
-    }
-});
-
-client.initialize();

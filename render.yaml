@@ -1,0 +1,24 @@
+# Blueprint de Render: New + → Blueprint → elige este repositorio.
+# Los valores con `sync: false` los escribes tú en el panel (nunca en el repo).
+services:
+  - type: web
+    name: avior-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ADMIN_KEY          # clave para abrir /qr (inventa una larga)
+        sync: false
+      - key: MONGODB_URI        # MongoDB Atlas gratuito: guarda la sesión de WhatsApp
+        sync: false
+      - key: MAIL_PROVIDER      # smtp | graph
+        value: smtp
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: TICKET_TO          # buzón que recibe los tickets
+        sync: false
+      - key: ADMIN_WHATSAPP     # opcional: avisa por WhatsApp si falla el correo (ej. 584121234567)
+        sync: false
